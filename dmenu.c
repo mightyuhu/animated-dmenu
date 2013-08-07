@@ -702,16 +702,17 @@ setup(void) {
 }
 
 void handle_return(char* value) {
-    puts(value);
-		ret = EXIT_SUCCESS;
-		running = False;
+  fputs(value, stdout);
+  fflush(stdout);
+  ret = EXIT_SUCCESS;
+  running = False;
 }
 
 void
 usage(void) {
 	fputs("usage: dmenu [-b] [-q] [-f] [-i] [-l lines] [-p prompt] [-fn font]\n"
 	      "             [-x xoffset] [-y yoffset]\n"
-          "             [-h height] [-w width]\n"
+        "             [-h height] [-w width]\n"
 	      "             [-nb color] [-nf color] [-sb color] [-sf color] [-v]\n", stderr);
 	exit(EXIT_FAILURE);
 }
