@@ -200,11 +200,14 @@ cistrstr(const char *s, const char *sub) {
 
 void
 cleanup(void) {
-    freecol(dc, normcol);
-    freecol(dc, selcol);
-    XDestroyWindow(dc->dpy, win);
-    XUngrabKeyboard(dc->dpy, CurrentTime);
+  freecol(dc, normcol);
+  freecol(dc, selcol);
+  XDestroyWindow(dc->dpy, win);
+  XUngrabKeyboard(dc->dpy, CurrentTime);
+  if (!dc->font.xft_font) {
+    // well prefere to not properly free acquired resources instead of a crash :-)
     freedc(dc);
+  }
 }
 
 void
