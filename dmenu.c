@@ -43,6 +43,7 @@ static void paste(void);
 static void readstdin(void);
 static void run(void);
 static void setup(void);
+static void handle_return(char* value);
 static void usage(void);
 
 static char text[BUFSIZ] = "";
@@ -76,6 +77,7 @@ static Item *prev, *curr, *next, *sel;
 static Window win;
 static XIC xic;
 static Bool fuzzy;
+static Bool returnearly = False;
 
 static int (*fstrncmp)(const char *, const char *, size_t) = strncmp;
 static char *(*fstrstr)(const char *, const char *) = strstr;
@@ -105,6 +107,8 @@ main(int argc, char *argv[]) {
 			fstrstr = cistrstr;
 			fstrchr = strchri;
 		}
+		else if(!strcmp(argv[i], "-r") || !strcmp(argv[i], "--return-early"))
+			returnearly = True;
 		else if(i+1 == argc)
 			usage();
 		/* these options take one argument */
@@ -403,9 +407,7 @@ keypress(XKeyEvent *ev) {
 		break;
 	case XK_Return:
 	case XK_KP_Enter:
-		puts((sel && !(ev->state & ShiftMask)) ? sel->text : text);
-		ret = EXIT_SUCCESS;
-		running = False;
+    handle_return((sel && !(ev->state & ShiftMask)) ? sel->text : text);
 	case XK_Right:
 		if(text[cursor] != '\0') {
 			cursor = nextrune(+1);
@@ -473,6 +475,10 @@ match_fuzzy(void) {
 
 	curr = sel = matches;
 	calcoffsets();
+
+  if(returnearly && curr && !curr->right) {
+    handle_return(curr->text);
+  }
 }
 
 void
@@ -527,6 +533,10 @@ match_tokens(void) {
 	}
 	curr = sel = matches;
 	calcoffsets();
+
+  if(returnearly && curr && !curr->right) {
+    handle_return(curr->text);
+  }
 }
 
 size_t
@@ -686,6 +696,12 @@ setup(void) {
 	XMapRaised(dc->dpy, win);
 	resizedc(dc, mw, mh);
 	drawmenu();
+}
+
+void handle_return(char* value) {
+    puts(value);
+		ret = EXIT_SUCCESS;
+		running = False;
 }
 
 void
