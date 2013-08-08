@@ -707,9 +707,12 @@ void handle_return(char* value) {
 
 void
 usage(void) {
-	fputs("usage: dmenu [-b] [-q] [-f] [-i] [-l lines] [-p prompt] [-fn font]\n"
+	fputs("usage: dmenu [-b] [-q] [-f] [-i] [-z] [-r] [-v]"
+        "             [-l lines]"
+        "             [-p prompt]"
+        "             [-fn font]\n"
 	      "             [-x xoffset] [-y yoffset]\n"
         "             [-h height] [-w width]\n"
-	      "             [-nb color] [-nf color] [-sb color] [-sf color] [-v]\n", stderr);
+	      "             [-nb color] [-nf color] [-sb color] [-sf color]\n", stderr);
 	exit(EXIT_FAILURE);
 }
