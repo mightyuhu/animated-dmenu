@@ -288,16 +288,13 @@ drawmenu(void) {
 
 void
 grabkeyboard(void) {
-	int i;
-
 	/* try to grab keyboard, we may have to wait for another process to ungrab */
-	for(i = 0; i < 1000; i++) {
+  while(1) {
 		if(XGrabKeyboard(dc->dpy, DefaultRootWindow(dc->dpy), True,
 		                 GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)
 			return;
 		usleep(1000);
 	}
-	eprintf("cannot grab keyboard\n");
 }
 
 void
