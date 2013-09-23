@@ -4,33 +4,45 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <time.h>
 #include <unistd.h>
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
-#ifdef XINERAMA
 #include <X11/extensions/Xinerama.h>
-#endif
 #include "draw.h"
+#include "hash.h"
 
-#define INTERSECT(x,y,w,h,r)  (MAX(0, MIN((x)+(w),(r).x_org+(r).width)  - MAX((x),(r).x_org)) \
-                             * MAX(0, MIN((y)+(h),(r).y_org+(r).height) - MAX((y),(r).y_org)))
+#define INTERSECT(x,y,w,h,r) \
+    (MAX(0, MIN((x)+(w),(r).x_org+(r).width)  - MAX((x),(r).x_org)) * \
+     MAX(0, MIN((y)+(h),(r).y_org+(r).height) - MAX((y),(r).y_org)))
+#define INRECT(x,y,rx,ry,rw,rh) \
+    ((x) >= (rx) && (x) < (rx)+(rw) && (y) >= (ry) && (y) < (ry)+(rh))
 #define MIN(a,b)              ((a) < (b) ? (a) : (b))
 #define MAX(a,b)              ((a) > (b) ? (a) : (b))
 #define DEFFONT "fixed" /* xft example: "Monospace-11" */
+#define TLINE_HEIGHT 1  /* height of the line at the top of the menu*/
+#define BLINE_HEIGHT 1  /* height of the line at the bottom of the menu*/
 
 typedef struct Item Item;
 struct Item {
 	char *text;
 	Item *left, *right;
-    Bool out;
+  Bool out;
+};
+
+typedef struct Menu Menu;
+struct Menu {
+  Item *prev;
+  Item *next;
+  Item *cfirst;   /* current first item of the displayed items */
 };
 
 static void appenditem(Item *item, Item **list, Item **last);
-static void calcoffsets(void);
+static void calcalloffsets(void);
+static void calcoffsets(int scrnum);
 static void cleanup(void);
 static char *cistrstr(const char *s, const char *sub);
-static void drawmenu(void);
 static void grabkeyboard(void);
 static void insert(const char *str, ssize_t n);
 static void keypress(XKeyEvent *ev);
@@ -43,15 +55,22 @@ static void paste(void);
 static void readstdin(void);
 static void run(void);
 static void setup(void);
+static void createwindow(Window *window, int scrnum);
+static void updatewindows(void);
+static void drawmenu(int scrnum);
 static void handle_return(char* value);
+static int writehistory(char *command);
+static void anim(int origin, int target);
+static void close_anim(void);
 static void usage(void);
 
 static char text[BUFSIZ] = "";
-static int bh, mw, mh;
+static int barh;
 static int inputw, promptw;
 static int xoffset = 0;
 static int yoffset = 0;
 static int width = 0;
+static int monitor = -1;
 static size_t cursor = 0;
 static const char *font = NULL;
 static const char *prompt = NULL;
@@ -59,7 +78,9 @@ static const char *normbgcolor = "#222222";
 static const char *normfgcolor = "#bbbbbb";
 static const char *selbgcolor  = "#005577";
 static const char *selfgcolor  = "#eeeeee";
-static unsigned int lines, line_height = 0;
+static unsigned int lmax = 1;
+static int line_height = 0;
+static Bool vertical = False;
 static ColorSet *normcol;
 static ColorSet *selcol;
 static Atom clip, utf8;
@@ -70,42 +91,20 @@ static int ret = 0;
 static DC *dc;
 static Item *items = NULL;
 static Item *matches, *matchend;
-static Item *prev, *curr, *next, *sel;
-static Window win;
+static Menu *menus;
+static Item *sel;
+static Window *windows;
+static unsigned int last_win_height = 0;
 static XIC xic;
 static Bool fuzzy;
 static Bool returnearly = False;
 static char *histfile = NULL;
 static size_t histsize = 0;
+static Bool animation = False;
 
 static int (*fstrncmp)(const char *, const char *, size_t) = strncmp;
 static char *(*fstrstr)(const char *, const char *) = strstr;
 static char *(*fstrchr)(const char *, const int) = strchr;
-
-
-static int
-writehistory(char *command) {
-	size_t i = 0;
-	FILE *f;
-
-	if(!histfile || strlen(command) <= 0)
-		return 0;
-
-	if((f = fopen(histfile, "w"))) {
-		fputs(command, f);
-		fputc('\n', f);
-		for(; i < histsize; i++) {
-			if(strcmp(command, items[i].text) != 0) {
-				fputs(items[i].text, f);
-				fputc('\n', f);
-			}
-		}
-		fclose(f);
-		return 1;
-	}
-
-	return 0;
-}
 
 int
 main(int argc, char *argv[]) {
@@ -115,17 +114,21 @@ main(int argc, char *argv[]) {
 	for(i = 1; i < argc; i++)
 		/* these options take no arguments */
 		if(!strcmp(argv[i], "-v")) {      /* prints version information */
-			puts("dmenu-"VERSION", © 2006-2012 dmenu engineers, see LICENSE for details");
+			puts("dmenu-"VERSION", © 2006-2012 dmenu engineers, 2013 Sylvain Benner, see LICENSE for details");
 			exit(EXIT_SUCCESS);
 		}
+		else if(!strcmp(argv[i], "-a"))   /* toggle animation on */
+			animation = True;
 		else if(!strcmp(argv[i], "-b"))   /* appears at the bottom of the screen */
 			topbar = False;
-		else if(!strcmp(argv[i], "-q"))
+		else if(!strcmp(argv[i], "-q"))   /* quiet mode */
 			quiet = True;
 		else if(!strcmp(argv[i], "-f"))   /* grabs keyboard before reading stdin */
 			fast = True;
 		else if(!strcmp(argv[i], "-z"))   /* enable fuzzy matching */
 			fuzzy = True;
+		else if(!strcmp(argv[i], "-lv"))  /* list items verticaly  */
+			vertical = True;
 		else if(!strcmp(argv[i], "-i")) { /* case-insensitive item matching */
 			fstrncmp = strncasecmp;
 			fstrstr = cistrstr;
@@ -142,23 +145,23 @@ main(int argc, char *argv[]) {
 			yoffset = atoi(argv[++i]);
 		else if(!strcmp(argv[i], "-w"))
 			width = atoi(argv[++i]);
-		else if(!strcmp(argv[i], "-l"))   /* number of lines in vertical list */
-			lines = atoi(argv[++i]);
-		else if(!strcmp(argv[i], "-h"))   /* minimum height of single line */
+		else if(!strcmp(argv[i], "-lmax"))  /* maximum number of lines in vertical mode */
+			lmax = atoi(argv[++i]);
+		else if(!strcmp(argv[i], "-m"))     /* dmenu appears on the given Xinerama screen */
+			monitor = atoi(argv[++i]);
+		else if(!strcmp(argv[i], "-h"))     /* minimum height of single line */
 			line_height = atoi(argv[++i]);
-		else if(!strcmp(argv[i], "-h"))   /* minimum height of single line */
-			line_height = atoi(argv[++i]);
-		else if(!strcmp(argv[i], "-p"))   /* adds prompt to left of input field */
+		else if(!strcmp(argv[i], "-p"))     /* adds prompt to left of input field */
 			prompt = argv[++i];
-		else if(!strcmp(argv[i], "-fn"))  /* font or font set */
+		else if(!strcmp(argv[i], "-fn"))    /* font or font set */
 			font = argv[++i];
-		else if(!strcmp(argv[i], "-nb"))  /* normal background color */
+		else if(!strcmp(argv[i], "-nb"))    /* normal background color */
 			normbgcolor = argv[++i];
-		else if(!strcmp(argv[i], "-nf"))  /* normal foreground color */
+		else if(!strcmp(argv[i], "-nf"))    /* normal foreground color */
 			normfgcolor = argv[++i];
-		else if(!strcmp(argv[i], "-sb"))  /* selected background color */
+		else if(!strcmp(argv[i], "-sb"))    /* selected background color */
 			selbgcolor = argv[++i];
-		else if(!strcmp(argv[i], "-sf"))  /* selected foreground color */
+		else if(!strcmp(argv[i], "-sf"))    /* selected foreground color */
 			selfgcolor = argv[++i];
 		else if(!strcmp(argv[i], "-hist"))
 			histfile = argv[++i];
@@ -169,6 +172,7 @@ main(int argc, char *argv[]) {
 	initfont(dc, font ? font : DEFFONT);
 	normcol = initcolor(dc, normfgcolor, normbgcolor);
 	selcol = initcolor(dc, selfgcolor, selbgcolor);
+  menus = calloc(dc->scrcount, sizeof(Menu));
 
 	if(fast) {
 		grabkeyboard();
@@ -180,7 +184,8 @@ main(int argc, char *argv[]) {
 	}
 	setup();
 	run();
-
+  if(animation)
+    close_anim();
 	cleanup();
 	return ret;
 }
@@ -198,19 +203,28 @@ appenditem(Item *item, Item **list, Item **last) {
 }
 
 void
-calcoffsets(void) {
+calcalloffsets(void){
+  for(int i=0; i<dc->scrcount; ++i){
+    calcoffsets(i);
+  }
+}
+
+void
+calcoffsets(int scrnum) {
+  Menu *m = &menus[scrnum];
+  DM *dm = &dc->menus[scrnum];
 	int i, n;
 
-	if(lines > 0)
-		n = lines * bh;
+	if(vertical)
+		n = lmax * barh;
 	else
-		n = mw - (promptw + inputw + textw(dc, "<") + textw(dc, ">"));
+		n = dm->width - (promptw + inputw + textw(dc, "<") + textw(dc, ">"));
 	/* calculate which items will begin the next page and previous page */
-	for(i = 0, next = curr; next; next = next->right)
-		if((i += (lines > 0) ? bh : MIN(textw(dc, next->text), n)) > n)
+	for(i = 0, m->next = m->cfirst; m->next; m->next = m->next->right)
+		if((i += (vertical) ? barh : MIN(textw(dc, m->next->text), n)) > n)
 			break;
-	for(i = 0, prev = curr; prev && prev->left; prev = prev->left)
-		if((i += (lines > 0) ? bh : MIN(textw(dc, prev->left->text), n)) > n)
+	for(i = 0, m->prev = m->cfirst; m->prev && m->prev->left; m->prev = m->prev->left)
+		if((i += (vertical) ? barh : MIN(textw(dc, m->prev->left->text), n)) > n)
 			break;
 }
 
@@ -228,73 +242,121 @@ void
 cleanup(void) {
   freecol(dc, normcol);
   freecol(dc, selcol);
-  XDestroyWindow(dc->dpy, win);
+  for(int i=0; i<dc->scrcount; ++i){
+    XDestroyWindow(dc->dpy, windows[i]);
+  }
   XUngrabKeyboard(dc->dpy, CurrentTime);
-  if (!dc->font.xft_font) {
-    // well prefere to not properly free acquired resources instead of a crash :-)
-    freedc(dc);
+  freedc(dc);
+  free(menus);
+}
+
+void
+updatewindows(void) {
+  for(int scrnum=0; scrnum<dc->scrcount; ++scrnum){
+    drawmenu(scrnum);
+  }
+  /* Check for new height on the first window only */
+  Item *item;
+  unsigned int nh = TLINE_HEIGHT + BLINE_HEIGHT;
+
+  if(vertical){
+    for(item = menus[0].cfirst; item != menus[0].next; item = item->right) {
+      nh += barh;
+    }
+  }
+
+  unsigned int new_win_height = nh + barh;
+  if(new_win_height != last_win_height){
+    for(int scrnum=0; scrnum<dc->scrcount; ++scrnum){
+      dc->menus[scrnum].height = new_win_height;
+      resizedc(dc, scrnum);
+      drawmenu(scrnum);
+    }
+    if(animation){
+      anim(last_win_height, new_win_height);
+    }
+    /* ensure that the final window height has been correctly set */
+    for(int scrnum=0; scrnum<dc->scrcount; ++scrnum){
+      DM *dm = &dc->menus[scrnum];
+      XMoveResizeWindow(dc->dpy, windows[scrnum], dm->x, dm->y, dm->width, dm->height);
+    }
+    last_win_height = new_win_height;
+  }
+  for(int scrnum=0; scrnum<dc->scrcount; ++scrnum){
+    mapdc(dc, scrnum, windows[scrnum]);
   }
 }
 
 void
-drawmenu(void) {
+drawmenu(int scrnum) {
+  Menu *m = &menus[scrnum];
+  DM *dm = &dc->menus[scrnum];
 	int curpos;
 	Item *item;
 
-	dc->x = 0;
-	dc->y = 0;
-	dc->h = bh;
-	drawrect(dc, 0, 0, mw, mh, True, normcol->BG);
+	dm->cx = 0;
+	dm->cy = 0;
+	dm->ch = barh;
+
+	drawrect(dc, scrnum, 0, 0, dm->width, TLINE_HEIGHT, True, selcol->BG);
+	dm->cy = TLINE_HEIGHT;
+	drawrect(dc, scrnum, 0, 0, dm->width, dm->height, True, normcol->BG);
 
 	if(prompt) {
-		dc->w = promptw;
-		drawtext(dc, prompt, selcol);
-		dc->x = dc->w;
+		dm->cw = promptw;
+		drawtext(dc, scrnum, prompt, selcol);
+		dm->cx = dm->cw;
 	}
 	/* draw input field */
-	dc->w = (lines > 0 || !matches) ? mw - dc->x : inputw;
-	drawtext(dc, text, normcol);
-	if((curpos = textnw(dc, text, cursor) + dc->font.height/2) < dc->w)
-    drawrect(dc, curpos, (dc->h - dc->font.height)/2 + 1, 1, dc->font.height - 1, True, normcol->FG);
+	dm->cw = (vertical || !matches) ? dm->width - dm->cx : inputw;
+	drawtext(dc, scrnum, text, normcol);
+	if((curpos = textnw(dc, text, cursor) + dc->font.height/2) < dm->cw)
+    drawrect(dc, scrnum, curpos, (dm->ch - dc->font.height)/2 + 1, 1,
+             dc->font.height - 1, True, normcol->FG);
 
   if(!quiet || strlen(text) > 0) {
-    if(lines > 0) {
+    if(vertical) {
       /* draw vertical list */
-      dc->w = mw - dc->x;
-      for(item = curr; item != next; item = item->right) {
-        dc->y += dc->h;
-        drawtext(dc, item->text, (item == sel) ? selcol : normcol);
+      dm->cw = dm->width - dm->cx;
+      for(item = m->cfirst; item != m->next; item = item->right) {
+        dm->cy += dm->ch;
+        drawtext(dc, scrnum, item->text, (item == sel) ? selcol : normcol);
       }
     }
     else if(matches) {
       /* draw horizontal list */
-      dc->x += inputw;
-      dc->w = textw(dc, "<");
-      if(curr->left)
-        drawtext(dc, "<", normcol);
-      for(item = curr; item != next; item = item->right) {
-        dc->x += dc->w;
-        dc->w = MIN(textw(dc, item->text), mw - dc->x - textw(dc, ">"));
-        drawtext(dc, item->text, (item == sel) ? selcol : normcol);
+      dm->cx += inputw;
+      dm->cw = textw(dc, "<");
+      if(m->cfirst->left)
+        drawtext(dc, scrnum, "<", normcol);
+      for(item = m->cfirst; item != m->next; item = item->right) {
+        dm->cx += dm->cw;
+        dm->cw = MIN(textw(dc, item->text), dm->width - dm->cx - textw(dc, ">"));
+        drawtext(dc, scrnum, item->text, (item == sel) ? selcol : normcol);
       }
-      dc->w = textw(dc, ">");
-      dc->x = mw - dc->w;
-      if(next)
-        drawtext(dc, ">", normcol);
+      dm->cw = textw(dc, ">");
+      dm->cx = dm->width - dm->cw;
+      if(m->next)
+        drawtext(dc, scrnum, ">", normcol);
     }
   }
-	mapdc(dc, win, mw, mh);
+  dm->cy += barh;
+  dm->cx = 0;
+	drawrect(dc, scrnum, 0, 0, dm->width, BLINE_HEIGHT, True, selcol->BG);
 }
 
 void
 grabkeyboard(void) {
+	int i;
+
 	/* try to grab keyboard, we may have to wait for another process to ungrab */
-  while(1) {
+	for(i = 0; i < 1000; i++) {
 		if(XGrabKeyboard(dc->dpy, DefaultRootWindow(dc->dpy), True,
 		                 GrabModeAsync, GrabModeAsync, CurrentTime) == GrabSuccess)
 			return;
 		usleep(1000);
 	}
+	eprintf("cannot grab keyboard\n");
 }
 
 void
@@ -320,6 +382,7 @@ keypress(XKeyEvent *ev) {
 	if(status == XBufferOverflow)
 		return;
 	if(ev->state & ControlMask)
+    /* emacs */
 		switch(ksym) {
 		case XK_a: ksym = XK_Home;      break;
 		case XK_b: ksym = XK_Left;      break;
@@ -348,13 +411,16 @@ keypress(XKeyEvent *ev) {
 				insert(NULL, nextrune(-1) - cursor);
 			break;
 		case XK_y: /* paste selection */
-			XConvertSelection(dc->dpy, (ev->state & ShiftMask) ? clip : XA_PRIMARY,
-			                  utf8, utf8, win, CurrentTime);
-			return;
-		default:
-			return;
-		}
+      for(int i=0; i<dc->scrcount; ++i){
+        XConvertSelection(dc->dpy, (ev->state & ShiftMask) ? clip : XA_PRIMARY,
+                          utf8, utf8, windows[i], CurrentTime);
+      }
+      return;
+    default:
+      return;
+    }
 	else if(ev->state & Mod1Mask)
+    /* vi */
 		switch(ksym) {
 		case XK_g: ksym = XK_Home;  break;
 		case XK_G: ksym = XK_End;   break;
@@ -385,15 +451,18 @@ keypress(XKeyEvent *ev) {
 			cursor = strlen(text);
 			break;
 		}
-		if(next) {
-			/* jump to end of list and position items in reverse */
-			curr = matchend;
-			calcoffsets();
-			curr = prev;
-			calcoffsets();
-			while(next && (curr = curr->right))
-				calcoffsets();
-		}
+    for(int i=0; i<dc->scrcount; ++i){
+      Menu *m = &menus[i];
+      if(m->next) {
+        /* jump to end of list and position items in reverse */
+        m->cfirst = matchend;
+        calcoffsets(i);
+        m->cfirst = m->prev;
+        calcoffsets(i);
+        while(m->next && (m->cfirst = m->cfirst->right))
+          calcalloffsets();
+      }
+    }
 		sel = matchend;
 		break;
 	case XK_Escape:
@@ -404,34 +473,47 @@ keypress(XKeyEvent *ev) {
 			cursor = 0;
 			break;
 		}
-		sel = curr = matches;
-		calcoffsets();
+    for(int i=0; i<dc->scrcount; ++i){
+      sel = menus[i].cfirst = matches;
+      calcoffsets(i);
+    }
 		break;
 	case XK_Left:
-		if(cursor > 0 && (!sel || !sel->left || lines > 0)) {
+		if(cursor > 0 && (!sel || !sel->left || vertical)) {
 			cursor = nextrune(-1);
 			break;
 		}
-		if(lines > 0)
+		if(vertical)
 			return;
 		/* fallthrough */
 	case XK_Up:
-		if(sel && sel->left && (sel = sel->left)->right == curr) {
-			curr = prev;
-			calcoffsets();
-		}
+    if(sel && sel->left){
+      sel = sel->left;
+    for(int i=0; i<dc->scrcount; ++i){
+      if(sel->right == menus[i].cfirst) {
+        menus[i].cfirst = menus[i].prev;
+        calcoffsets(i);
+      }
+    }
+    }
 		break;
 	case XK_Next:
-		if(!next)
+    /* take the default screen's pages */
+		if(!menus[0].next)
 			return;
-		sel = curr = next;
-		calcoffsets();
+    for(int i=0; i<dc->scrcount; ++i){
+      sel = menus[i].cfirst = menus[0].next;
+    }
+    calcalloffsets();
 		break;
 	case XK_Prior:
-		if(!prev)
+    /* take the default screen's pages */
+		if(!menus[0].prev)
 			return;
-		sel = curr = prev;
-		calcoffsets();
+    for(int i=0; i<dc->scrcount; ++i){
+		  sel = menus[i].cfirst = menus[0].prev;
+    }
+		calcalloffsets();
 		break;
 	case XK_Return:
 	case XK_KP_Enter:
@@ -442,14 +524,19 @@ keypress(XKeyEvent *ev) {
 			cursor = nextrune(+1);
 			break;
 		}
-		if(lines > 0)
+		if(vertical)
 			return;
 		/* fallthrough */
 	case XK_Down:
-		if(sel && sel->right && (sel = sel->right) == next) {
-			curr = next;
-			calcoffsets();
-		}
+    if(sel && sel->right){
+      sel = sel->right;
+      for(int i=0; i<dc->scrcount; ++i){
+        if(sel == menus[i].next) {
+          menus[i].cfirst = menus[i].next;
+          calcoffsets(i);
+        }
+      }
+    }
 		break;
 	case XK_Tab:
 		if(!sel)
@@ -459,7 +546,7 @@ keypress(XKeyEvent *ev) {
 		match();
 		break;
 	}
-	drawmenu();
+	updatewindows();
 }
 
 char *
@@ -487,7 +574,7 @@ match(void) {
 
 void
 match_fuzzy(void) {
-	int i;
+	size_t i;
 	size_t len;
 	Item *item;
 
@@ -502,11 +589,14 @@ match_fuzzy(void) {
 		if(i == len) appenditem(item, &matches, &matchend);
 	}
 
-	curr = sel = matches;
-	calcoffsets();
+  sel = matches;
+  for(int i=0; i<dc->scrcount; ++i){
+	  menus[i].cfirst = sel;
+  }
+	calcalloffsets();
 
-  if(returnearly && curr && !curr->right) {
-    handle_return(curr->text);
+  if(returnearly && menus[0].cfirst && !menus[0].cfirst->right) {
+    handle_return(menus[0].cfirst->text);
   }
 }
 
@@ -560,11 +650,14 @@ match_tokens(void) {
 			matches = lsubstr;
 		matchend = substrend;
 	}
-	curr = sel = matches;
-	calcoffsets();
+  sel = matches;
+  for(int i=0; i<dc->scrcount; ++i){
+	  menus[i].cfirst = sel;
+  }
+	calcalloffsets();
 
-  if(returnearly && curr && !curr->right) {
-    handle_return(curr->text);
+  if(returnearly && menus[0].cfirst && !menus[0].cfirst->right) {
+    handle_return(menus[0].cfirst->text);
   }
 }
 
@@ -579,17 +672,18 @@ nextrune(int inc) {
 
 void
 paste(void) {
-	char *p, *q;
-	int di;
-	unsigned long dl;
-	Atom da;
-
 	/* we have been given the current selection, now insert it into input */
-	XGetWindowProperty(dc->dpy, win, utf8, 0, (sizeof text / 4) + 1, False,
-	                   utf8, &da, &di, &dl, &dl, (unsigned char **)&p);
-	insert(p, (q = strchr(p, '\n')) ? q-p : (ssize_t)strlen(p));
-	XFree(p);
-	drawmenu();
+  for(int i=0; i<dc->scrcount; ++i){
+    char *p, *q;
+    int di;
+    unsigned long dl;
+    Atom da;
+    XGetWindowProperty(dc->dpy, windows[i], utf8, 0, (sizeof text / 4) + 1, False,
+                       utf8, &da, &di, &dl, &dl, (unsigned char **)&p);
+    insert(p, (q = strchr(p, '\n')) ? q-p : (ssize_t)strlen(p));
+    XFree(p);
+  }
+	updatewindows();
 }
 
 void
@@ -610,6 +704,10 @@ readstdin(void) {
 	}\
 	/* lines from the history file must appear first in menu */
 	FILE *f;
+  /* hash_t *hitems = hash_new(); */
+  /* hash_set(hitems, "item1", (void *)1); */
+  /* hash_each(hitems, {printf("%s: %p\n", key, val);}); */
+  /* hash_free(hitems); */
 	if(histfile && (f = fopen(histfile, "r"))) {
 		readstdin_internals(f);
 		histsize = i;
@@ -620,7 +718,27 @@ readstdin(void) {
 	if(items)
 		items[i].text = NULL;
 	inputw = maxstr ? textw(dc, maxstr) : 0;
-	lines = MIN(lines, i);
+}
+
+int
+writehistory(char *command) {
+	size_t i = 0;
+	FILE *f;
+	if(!histfile || strlen(command) <= 0)
+		return 0;
+	if((f = fopen(histfile, "w"))) {
+		fputs(command, f);
+		fputc('\n', f);
+		for(; i < histsize; i++) {
+			if(strcmp(command, items[i].text) != 0) {
+				fputs(items[i].text, f);
+				fputc('\n', f);
+			}
+		}
+		fclose(f);
+		return 1;
+	}
+	return 0;
 }
 
 void
@@ -628,12 +746,20 @@ run(void) {
 	XEvent ev;
 
 	while(running && !XNextEvent(dc->dpy, &ev)) {
-		if(XFilterEvent(&ev, win))
-			continue;
+    Bool filter = True;
+    for(int i=0; i<dc->scrcount; ++i){
+      if(!XFilterEvent(&ev, windows[i]))
+        filter = False;
+    }
+    if(filter){
+      continue;
+    }
 		switch(ev.type) {
 		case Expose:
 			if(ev.xexpose.count == 0)
-				mapdc(dc, win, mw, mh);
+        for(int i=0; i<dc->scrcount; ++i){
+          mapdc(dc, i, windows[i]);
+        }
 			break;
 		case KeyPress:
 			keypress(&ev.xkey);
@@ -644,7 +770,9 @@ run(void) {
 			break;
 		case VisibilityNotify:
 			if(ev.xvisibility.state != VisibilityUnobscured)
-				XRaiseWindow(dc->dpy, win);
+        for(int i=0; i<dc->scrcount; ++i){
+          XRaiseWindow(dc->dpy, windows[i]);
+        }
 			break;
 		}
 	}
@@ -652,87 +780,107 @@ run(void) {
 
 void
 setup(void) {
-	int x, y, screen = DefaultScreen(dc->dpy);
-	Window root = RootWindow(dc->dpy, screen);
-	XSetWindowAttributes swa;
-	XIM xim;
-#ifdef XINERAMA
-	int n;
-	XineramaScreenInfo *info;
-#endif
+	int screen = DefaultScreen(dc->dpy);
 
 	clip = XInternAtom(dc->dpy, "CLIPBOARD",   False);
 	utf8 = XInternAtom(dc->dpy, "UTF8_STRING", False);
 
 	/* calculate menu geometry */
-	bh = (line_height > dc->font.height + 2) ? line_height : dc->font.height + 2;
-	lines = MAX(lines, 0);
-	mh = (lines + 1) * bh;
-#ifdef XINERAMA
-	if((info = XineramaQueryScreens(dc->dpy, &n))) {
-		int a, j, di, i = 0, area = 0;
-		unsigned int du;
-		Window w, pw, dw, *dws;
-		XWindowAttributes wa;
-
-		XGetInputFocus(dc->dpy, &w, &di);
-		if(w != root && w != PointerRoot && w != None) {
-			/* find top-level window containing current input focus */
-			do {
-				if(XQueryTree(dc->dpy, (pw = w), &dw, &w, &dws, &du) && dws)
-					XFree(dws);
-			} while(w != root && w != pw);
-			/* find xinerama screen with which the window intersects most */
-			if(XGetWindowAttributes(dc->dpy, pw, &wa))
-				for(j = 0; j < n; j++)
-					if((a = INTERSECT(wa.x, wa.y, wa.width, wa.height, info[j])) > area) {
-						area = a;
-						i = j;
-					}
-		}
-		/* no focused window is on screen, so use pointer location instead */
-		if(!area && XQueryPointer(dc->dpy, root, &dw, &dw, &x, &y, &di, &di, &du))
-			for(i = 0; i < n; i++)
-				if(INTERSECT(x, y, 1, 1, info[i]))
-					break;
-
-		x = info[i].x_org;
-		y = info[i].y_org + (topbar ? yoffset : info[i].height - mh - yoffset);
-		mw = info[i].width;
-		XFree(info);
+	barh = (line_height > dc->font.height + 2) ? line_height : dc->font.height + 2;
+	lmax = MAX(lmax, 0);
+  windows = (Window *)calloc(dc->scrcount, sizeof(Window));
+  if(dc->info){
+    for(int i=0; i<dc->scrcount; ++i) {
+      DM *dm = &dc->menus[i];
+      dm->width = dc->info[i].width;
+      dm->height = barh + TLINE_HEIGHT + BLINE_HEIGHT;
+      dm->x = dc->info[i].x_org;
+      dm->y = dc->info[i].y_org +
+        (topbar ? yoffset : dc->info[i].height - dm->height - yoffset);
+      createwindow(&windows[i], i);
+    }
 	}
 	else
-#endif
 	{
-		x = 0;
-		y = topbar ? yoffset : DisplayHeight(dc->dpy, screen) - mh - yoffset;
-		mw = DisplayWidth(dc->dpy, screen);
+    DM *dm = &dc->menus[0];
+		dm->x = 0;
+		dm->width = DisplayWidth(dc->dpy, screen);
+      dm->height = barh + TLINE_HEIGHT + BLINE_HEIGHT;
+		dm->y = topbar ? yoffset : DisplayHeight(dc->dpy, screen) - dm->width - yoffset;
+    createwindow(&windows[0], 0);
 	}
+  updatewindows();
+}
 
-    x += xoffset;
-    mw = width ? width : mw;
+void
+createwindow(Window *window, int scrnum) {
+  DM *dm = &dc->menus[scrnum];
+	int screen = DefaultScreen(dc->dpy);
+	Window root = RootWindow(dc->dpy, screen);
+	XSetWindowAttributes swa;
+	XIM xim;
+
+  dm->x += xoffset;
+  dm->width = width ? width : dm->width;
 
 	promptw = prompt ? textw(dc, prompt) : 0;
-	inputw = MIN(inputw, mw/3);
+	inputw = MIN(inputw, dm->width/3);
 	match();
 
 	/* create menu window */
 	swa.override_redirect = True;
-	swa.background_pixel = normcol->BG;
 	swa.event_mask = ExposureMask | KeyPressMask | VisibilityChangeMask;
-	win = XCreateWindow(dc->dpy, root, x, y, mw, mh, 0,
-	                    DefaultDepth(dc->dpy, screen), CopyFromParent,
-	                    DefaultVisual(dc->dpy, screen),
-	                    CWOverrideRedirect | CWBackPixel | CWEventMask, &swa);
+	*window = XCreateWindow(dc->dpy, root, dm->x, dm->y, dm->width, dm->height, 0,
+	                       DefaultDepth(dc->dpy, screen), CopyFromParent,
+	                       DefaultVisual(dc->dpy, screen),
+	                       CWOverrideRedirect | CWEventMask, &swa);
 
 	/* open input methods */
-	xim = XOpenIM(dc->dpy, NULL, NULL, NULL);
+  xim = XOpenIM(dc->dpy, NULL, NULL, NULL);
 	xic = XCreateIC(xim, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
-	                XNClientWindow, win, XNFocusWindow, win, NULL);
+	                XNClientWindow, *window, XNFocusWindow, *window, NULL);
 
-	XMapRaised(dc->dpy, win);
-	resizedc(dc, mw, mh);
-	drawmenu();
+  if(monitor == -1 || monitor == scrnum){
+    XMapRaised(dc->dpy, *window);
+  }
+	resizedc(dc, scrnum);
+}
+
+int msleep(unsigned long milisec)
+{
+  struct timespec req={0, 0};
+  time_t sec=(int)(milisec/1000);
+  milisec=milisec-(sec*1000);
+  req.tv_sec=sec;
+  req.tv_nsec=milisec*1000000L;
+  while(nanosleep(&req,&req)==-1)
+    continue;
+  return 1;
+}
+
+void
+anim(int origin, int target){
+  int length = 100;
+  int frequency = 60;
+  int steps = frequency*length/1000;
+  float interval = length/steps;
+  float current = origin;
+  float increment = (target - origin) / steps;
+  for (int i=0; i<steps; ++i){
+    current += increment;
+    for(int scrnum=0; scrnum<dc->scrcount; ++scrnum){
+      DM *dm = &dc->menus[scrnum];
+      XMoveResizeWindow(dc->dpy, windows[scrnum], dm->x, dm->y, dm->width, current);
+      mapdc(dc, scrnum, windows[scrnum]);
+    }
+    msleep(interval);
+    XFlush(dc->dpy);
+  }
+}
+
+void
+close_anim(void){
+  anim(dc->menus[0].height, 1);
 }
 
 void handle_return(char* value) {
@@ -744,13 +892,60 @@ void handle_return(char* value) {
 
 void
 usage(void) {
-	fputs("usage: dmenu [-b] [-q] [-f] [-i] [-z] [-r] [-v]\n"
-        "             [-l lines]\n"
-        "             [-p prompt]\n"
-        "             [-fn font]\n"
-        "             [-hist file]\n"
-	      "             [-x xoffset] [-y yoffset]\n"
-        "             [-h height] [-w width]\n"
-	      "             [-nb color] [-nf color] [-sb color] [-sf color]\n", stderr);
+    printf("Usage: dmenu [OPTION]...\n");
+    printf("Display newline-separated input stdin as a menubar\n");
+    printf("\n");
+    printf("  -a            toggle animations on\n");
+    printf("\n");
+    printf("  -b            dmenu appears at the bottom of the screen\n");
+    printf("\n");
+    printf("  -f            grab keyboard before reading stdin\n");
+    printf("\n");
+    printf("  -h N          set dmenu height to N pixels\n");
+    printf("\n");
+    printf("  -hist FILE    store user choices in the specified file,\n");
+    printf("                the value in the file are always displayed\n");
+    printf("                first.\n");
+    printf("\n");
+    printf("  -i            dmenu matches menu items case insensitively\n");
+    printf("\n");
+    printf("  -lmax LINES   maximum number of lines when items are\n");
+    printf("                vertically listed\n");
+    printf("\n");
+    printf("  -lv           dmenu lists items in vertically.\n");
+    printf("\n");
+    printf("  -m MONITOR    dmenu appears only on the given screen. If this\n");
+    printf("                agument is not set, dmenu displays the menu on\n");
+    printf("                all available monitors.\n");
+    printf("\n");
+    printf("  -p PROMPT     prompt to be displayed to the left of the\n");
+    printf("                input field\n");
+    printf("\n");
+    printf("  -q            quiet mode\n");
+    printf("\n");
+    printf("  -r            return as soon as a single match is found\n");
+    printf("\n");
+    printf("  -fn FONT      font or font set to be used\n");
+    printf("\n");
+    printf("  -nb COLOR     normal background color\n");
+    printf("                #RGB, #RRGGBB, and color names supported\n");
+    printf("\n");
+    printf("  -nf COLOR     normal foreground color\n");
+    printf("\n");
+    printf("  -sb COLOR     selected background color\n");
+    printf("\n");
+    printf("  -sf COLOR     selected foreground color\n");
+    printf("\n");
+    printf("  -v            display version information\n");
+    printf("\n");
+    printf("  -w N          set dmenu width to N pixels\n");
+    printf("\n");
+    printf("  -x N          set dmenu x offset to N pixels\n");
+    printf("\n");
+    printf("  -y N          set dmenu y offset to N pixels\n");
+    printf("\n");
+    printf("  -z            enable fuzzy matching, if this option is not\n");
+    printf("                specified then token matching is used.");
+
 	exit(EXIT_FAILURE);
 }

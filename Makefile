@@ -3,10 +3,10 @@
 
 include config.mk
 
-SRC = dmenu.c draw.c stest.c
+SRC = dmenu.c draw.c stest.c hash.c
 OBJ = ${SRC:.c=.o}
 
-all: options dmenu stest
+all: dmenu stest
 
 options:
 	@echo dmenu build options:
@@ -18,18 +18,17 @@ options:
 	@echo CC -c $<
 	@${CC} -c $< ${CFLAGS} `freetype-config --cflags --libs`
 
-${OBJ}: config.mk draw.h
+${OBJ}: config.mk draw.h hash.h
 
-dmenu: dmenu.o draw.o
+dmenu: dmenu.o draw.o hash.o
 	@echo CC -o $@
-	@${CC} -o $@ dmenu.o draw.o ${LDFLAGS} `freetype-config --cflags --libs`
+	@${CC} -o $@ dmenu.o draw.o hash.o ${LDFLAGS} `freetype-config --cflags --libs`
 
 stest: stest.o
 	@echo CC -o $@
 	@${CC} -o $@ stest.o ${LDFLAGS}
 
 clean:
-	@echo cleaning
 	@rm -f dmenu stest ${OBJ} dmenu-${VERSION}.tar.gz
 
 dist: clean
