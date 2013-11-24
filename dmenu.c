@@ -860,7 +860,7 @@ int msleep(unsigned long milisec)
 
 void
 anim(int origin, int target){
-  int length = 100;
+  int length = 60;
   int frequency = 60;
   int steps = frequency*length/1000;
   float interval = length/steps;
